@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3인 WebRTC 웹소켓 가위바위보</title>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; max-width: 600px; margin: 20px auto; padding: 20px; text-align: center; background-color: #f4f7f6; }
+        h1 { color: #333; }
+        .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .step { display: none; }
+        .step.active { display: block; }
+        input { padding: 10px; font-size: 16px; width: 60%; max-width: 200px; text-align: center; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 5px; }
+        button { background-color: #4CAF50; color: white; border: none; padding: 10px 20px; font-size: 16px; border-radius: 5px; cursor: pointer; margin: 5px; }
+        button:hover { background-color: #45a049; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        .choice-btn { font-size: 24px; padding: 20px; width: 80px; }
+        .status { font-weight: bold; color: #2196F3; margin: 10px 0; }
+        .result-box { font-size: 18px; margin-top: 15px; padding: 10px; background: #eef; border-radius: 5px; line-height: 1.6; }
+    </style>
+</head>
+<body>
+
+    <h1>✊✌️✋ 3인 WebRTC 가위바위보</h1>
+    
+    <!-- 1단계: 방 입력 및 접속 -->
+    <div id="step1" class="card step active">
+        <h3>방 번호를 입력하고 접속하세요</h3>
+        <p>친구들과 동일한 방 번호를 입력하면 자동으로 P2P 연결이 진행됩니다.</p>
+        <input type="text" id="room-id" placeholder="예: 1234" value="1234"><br>
+        <button onclick="connectToRoom()">방 접속하기</button>
+    </div>
+
+    <!-- 2단계: 연결 대기 상태 -->
+    <div id="step2" class="card step">
+        <h3>P2P 연결을 구성하는 중입니다</h3>
+        <div id="status-msg" class="status">시그널링 서버 연결 중...</div>
+        <p style="font-size: 14px; color: #666;">(총 3명이 같은 방에 접속해야 게임이 시작됩니다)</p>
+    </div>
+
+    <!-- 3단계: 게임 화면 -->
+    <div id="step3" class="card step">
+        <h3>가위바위보!</h3>
+        <p id="game-connections">나의 역할: 확인 중...</p>
+        <div id="game-status" class="status">세 명 모두 연결되었습니다. 낼 것을 선택하세요!</div>
+        
+        <div style="margin: 20px 0;">
+            <button class="choice-btn" onclick="makeChoice('✌️')">✌️</button>
+            <button class="choice-btn" onclick="makeChoice('✊')">✊</button>
+            <button class="choice-btn" onclick="makeChoice('✋')">✋</button>
+        </div>
+        
+        <div id="my-choice-display">선택 대기 중...</div>
+        <div id="result" class="result-box" style="display:none;"></div>
+        <button id="reset-btn" onclick="resetGame()" style="display:none; margin-top:15px;">다시 하기</button>
+    </div>
+
+    <script>
+        let ws;
+        let roomId;
+        let myId;
+        let members = []; // 방에 참가한 멤버 목록 (정렬됨)
+        let myRole = '';   // 'host', 'guestA', 'guestB'
+        
+        let peers = {}; 
+        let dataChannels = {};
+        const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+        let myChoice = '';
+        let allChoices = {};
+
+        function showStep(stepId) {
+            document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+            document.getElementById(stepId).classList.add('active');
+        }
+
+        function connectToRoom() {
+            roomId = document.getElementById('room-id').value.trim();
+            if(!roomId) return alert("방 번호를 입력해주세요.");
+
+            showStep('step2');
+            document.getElementById('status-msg').innerText = "시그널링 웹소켓 연결 중...";
+
+            // 공용 무료 테스트용 시그널링 서버 (PieSocket 사용 - 개발/테스트용)
+            // 실제 서비스 적용 시 자체 Node.js 웹소켓 서버 구축을 권장합니다.
+            const apiKey = "o79v67G9hID6X8b5S4N7K3x7T2g5Y4u1"; // 임시 퍼블릭 키
+            ws = new WebSocket(`wss://demo.piesocket.com/v3/${roomId}?api_key=${apiKey}`);
+
+            ws.onopen = () => {
+                myId = "user_" + Math.random().toString(36).substr(2, 5);
+                document.getElementById('status-msg').innerText = "방 입장 완료. 친구를 기다리는 중...";
+                
+                // 내가 입장했음을 알림
+                sendSignal({ type: 'join', from: myId });
+            };
+
+            ws.onmessage = async (e) => {
+                const data = JSON.parse(e.data);
+                
+                if (data.from === myId) return; // 내가 보낸 메시지는 무시
+
+                switch(data.type) {
+                    case 'join':
+                        // 새 참여자가 오면 나도 존재를 알림
+                        sendSignal({ type: 'presence', from: myId });
+                        addMember(data.from);
+                        break;
+                    case 'presence':
+                        addMember(data.from);
+                        break;
+                    case 'offer':
+                        if (data.target === myId) {
+                            await handleOffer(data.from, data.sdp);
+                        }
+                        break;
+                    case 'answer':
+                        if (data.target === myId) {
+                            await handleAnswer(data.from, data.sdp);
+                        }
+                        break;
+                    case 'candidate':
+                        if (data.target === myId && peers[data.from]) {
+                            await peers[data.from].addIceCandidate(new RTCIceCandidate(data.candidate));
+                        }
+                        break;
+                }
+            };
+        }
+
+        function sendSignal(msg) {
+            if(ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(msg));
+            }
+        }
+
+        function addMember(id) {
+            if(!members.includes(id)) {
+                members.push(id);
+                determineRoles();
+            }
+        }
+
+        function determineRoles() {
+            // 나를 포함한 전체 멤버 목록 정렬 (역할 동기화를 위해 고유 ID 기준 정렬)
+            let allUsers = [myId, ...members].sort();
+            
+            // 3명이 모이면 역할 정의 및 WebRTC 연결 시작
+            if (allUsers.length === 3) {
+                const hostId = allUsers[0];
+                const guestAId = allUsers[1];
+                const guestBId = allUsers[2];
+
+                if (myId === hostId) myRole = 'host';
+                else if (myId === guestAId) myRole = 'guestA';
+                else if (myId === guestBId) myRole = 'guestB';
+
+                document.getElementById('status-msg').innerText = `역할 배정 완료 (${myRole}). P2P 터널 개설 중...`;
+                
+                // 역할에 따라 P2P 연결 개시 (Host가 연결을 제안함)
+                if (myRole === 'host') {
+                    setupHostConnection(guestAId);
+                    setupHostConnection(guestBId);
+                }
+            }
+        }
+
+        // Host가 Guest 채널 생성
+        async function setupHostConnection(guestId) {
+            const pc = new RTCPeerConnection(config);
+            const dc = pc.createDataChannel("gameChannel");
+            
+            peers[guestId] = pc;
+            dataChannels[guestId] = dc;
+            setupDataChannelEvents(dc, guestId);
+
+            pc.onicecandidate = e => {
+                if (e.candidate) {
+                    sendSignal({ type: 'candidate', from: myId, target: guestId, candidate: e.candidate });
+                }
+            };
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            sendSignal({ type: 'offer', from: myId, target: guestId, sdp: pc.localDescription });
+        }
+
+        // Guest가 Host 제안 처리
+        async function handleOffer(hostId, sdp) {
+            const pc = new RTCPeerConnection(config);
+            peers[hostId] = pc;
+
+            pc.ondatachannel = e => {
+                const dc = e.channel;
+                dataChannels['host'] = dc;
+                setupDataChannelEvents(dc, 'host');
+            };
+
+            pc.onicecandidate = e => {
+                if (e.candidate) {
+                    sendSignal({ type: 'candidate', from: myId, target: hostId, candidate: e.candidate });
+                }
+            };
+
+            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            sendSignal({ type: 'answer', from: myId, target: hostId, sdp: pc.localDescription });
+        }
+
+        async function handleAnswer(guestId, sdp) {
+            if (peers[guestId]) {
+                await peers[guestId].setRemoteDescription(new RTCSessionDescription(sdp));
+            }
+        }
+
+        // 데이터 채널 매핑 및 이벤트 처리
+        function setupDataChannelEvents(dc, remoteId) {
+            dc.onopen = () => {
+                checkAllConnections();
+            };
+            dc.onclose = () => {
+                alert("연결이 끊어졌습니다.");
+                location.reload();
+            };
+            dc.onmessage = e => {
+                const data = JSON.parse(e.data);
+                if (data.type === 'choice') {
+                    allChoices[data.from] = data.val;
+                    if (myRole === 'host') {
+                        broadcastToGuests({ type: 'sync_choice', from: data.from, val: data.val });
+                        checkGameResult();
+                    }
+                } else if (data.type === 'sync_choice') {
+                    allChoices[data.from] = data.val;
+                    checkGameResult();
+                } else if (data.type === 'reset') {
+                    resetGameLocal();
+                }
+            };
+        }
+
+        function checkAllConnections() {
+            const connectedCount = Object.values(dataChannels).filter(dc => dc.readyState === 'open').length;
+            if ((myRole === 'host' && connectedCount === 2) || (myRole !== 'host' && connectedCount === 1)) {
+                showStep('step3');
+                let roleKor = myRole === 'host' ? '방장 (Host)' : (myRole === 'guestA' ? '게스트 A' : '게스트 B');
+                document.getElementById('game-connections').innerHTML = `나의 역할: <strong>${roleKor}</strong>`;
+            }
+        }
+
+        function broadcastToGuests(msg) {
+            Object.keys(dataChannels).forEach(id => {
+                if(dataChannels[id] && dataChannels[id].readyState === 'open') {
+                    dataChannels[id].send(JSON.stringify(msg));
+                }
+            });
+        }
+
+        // 가위바위보 게임 로직
+        function makeChoice(choice) {
+            myChoice = choice;
+            allChoices[myRole] = choice;
+            document.getElementById('my-choice-display').innerText = `내가 낸 것: ${choice} (다른 플레이어 선택 대기 중...)`;
+            document.querySelectorAll('.choice-btn').forEach(b => b.disabled = true);
+
+            if (myRole === 'host') {
+                broadcastToGuests({ type: 'sync_choice', from: 'host', val: choice });
+                checkGameResult();
+            } else {
+                if (dataChannels['host'] && dataChannels['host'].readyState === 'open') {
+                    dataChannels['host'].send(JSON.stringify({ type: 'choice', from: myRole, val: choice }));
+                }
+            }
+        }
+
+        function checkGameResult() {
+            if (allChoices['host'] && allChoices['guestA'] && allChoices['guestB']) {
+                const h = allChoices['host'];
+                const a = allChoices['guestA'];
+                const b = allChoices['guestB'];
+
+                const uniqueChoices = Array.from(new Set([h, a, b]));
+                let resultText = `<strong>[결과]</strong><br>방장: ${h} | 게스트A: ${a} | 게스트B: ${b}<br><br>`;
+
+                if (uniqueChoices.length === 1 || uniqueChoices.length === 3) {
+                    resultText += "🤝 <strong>무승부(비김)!</strong> 다시 하세요.";
+                } else {
+                    let winningType = '';
+                    // 두 종류만 나왔을 때 승리 조합 확인
+                    if (uniqueChoices.includes('✊') && uniqueChoices.includes('✌️')) winningType = '✊';
+                    else if (uniqueChoices.includes('✌️') && uniqueChoices.includes('✋')) winningType = '✌️';
+                    else if (uniqueChoices.includes('✋') && uniqueChoices.includes('✊')) winningType = '✋';
+
+                    let winners = [];
+                    if(h === winningType) winners.push('방장');
+                    if(a === winningType) winners.push('게스트A');
+                    if(b === winningType) winners.push('게스트B');
+
+                    resultText += `🎉 <strong>승자: ${winners.join(', ')}</strong> 축하합니다!`;
+                }
+
+                document.getElementById('result').innerHTML = resultText;
+                document.getElementById('result').style.display = 'block';
+                document.getElementById('reset-btn').style.display = 'inline-block';
+            }
+        }
+
+        function resetGame() {
+            if (myRole === 'host') {
+                broadcastToGuests({ type: 'reset' });
+                resetGameLocal();
+            } else {
+                dataChannels['host'].send(JSON.stringify({ type: 'reset' }));
+            }
+        }
+
+        function resetGameLocal() {
+            myChoice = '';
+            allChoices = {};
+            document.getElementById('my-choice-display').innerText = "선택 대기 중...";
+            document.getElementById('result').style.display = 'none';
+            document.getElementById('reset-btn').style.display = 'none';
+            document.querySelectorAll('.choice-btn').forEach(b => b.disabled = false);
+        }
+    </script>
+</body>
+</html>
